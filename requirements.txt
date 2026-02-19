@@ -1,0 +1,6 @@
+# Core — tkinter ships with Python for Windows, no install needed.
+
+# Optional but strongly recommended:
+pystray>=0.19.0      # system tray icon
+Pillow>=10.0.0       # required by pystray for icon rendering
+keyboard>=0.13.5     # global hotkeys
