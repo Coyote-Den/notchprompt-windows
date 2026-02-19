@@ -25,6 +25,7 @@ import threading
 import time
 import sys
 import os
+import json
 
 # Optional imports (graceful fallback)
 try:
@@ -77,6 +78,10 @@ DEFAULT_WIDTH   = 700
 DEFAULT_HEIGHT  = 140
 SCROLL_TICK_MS  = 16          # ~60 fps
 
+# Settings file — saved to %APPDATA%\NotchPrompt\settings.json
+SETTINGS_DIR  = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NotchPrompt")
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+
 
 # ─────────────────────────────────────────────
 #  Helper: create a simple coloured tray icon
@@ -106,22 +111,42 @@ class NotchPrompt:
         self.overlay_w    = DEFAULT_WIDTH
         self.overlay_h    = DEFAULT_HEIGHT
         self.countdown_n  = 0         # 0 = disabled
+        self.overlay_alpha = OVERLAY_ALPHA
         self.privacy_mode = False     # WS_EX_LAYERED trick (best-effort)
         self._scroll_job  = None
         self._cd_job      = None
         self._canvas_text_id = None
         self._canvas_h    = 0         # total canvas content height
+        self._overlay_x   = None      # saved x position (None = centre on start)
+        self._overlay_y   = 0
+        self._controls_x  = None
+        self._controls_y  = None
 
-        # ── Tk variables (bound to controls) ──
+        # ── load persisted settings ────────────
+        self._load_settings()
+
+        # ── Tk variables (bound to controls) — seeded from loaded settings ──
         self.var_speed    = tk.IntVar(value=self.speed)
         self.var_font_sz  = tk.IntVar(value=self.font_size)
         self.var_width    = tk.IntVar(value=self.overlay_w)
         self.var_height   = tk.IntVar(value=self.overlay_h)
         self.var_countdown= tk.IntVar(value=self.countdown_n)
+        self.var_alpha    = tk.DoubleVar(value=self.overlay_alpha)
 
         self._build_overlay()
         self._build_controls()
         self._update_canvas_text()
+
+        # Restore privacy mode — apply WinAPI affinity directly (don't call
+        # toggle_privacy which would flip the state before applying)
+        if self.privacy_mode:
+            self.btn_priv.config(text="🔒 Privacy ON")
+            try:
+                import ctypes
+                hwnd = self.overlay.winfo_id()
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+            except Exception:
+                pass
 
         if HAS_KEYBOARD:
             self._register_hotkeys()
@@ -133,6 +158,62 @@ class NotchPrompt:
         self.root.mainloop()
 
     # ──────────────────────────────────────────
+    #  Settings persistence
+    # ──────────────────────────────────────────
+    def _load_settings(self):
+        """Load settings from JSON file. Silently uses defaults if missing."""
+        try:
+            if not os.path.exists(SETTINGS_PATH):
+                print(f"[INFO] No saved settings found at: {SETTINGS_PATH}")
+                return
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            self.speed         = int(s.get("speed",         self.speed))
+            self.font_size     = int(s.get("font_size",     self.font_size))
+            self.overlay_w     = int(s.get("overlay_w",     self.overlay_w))
+            self.overlay_h     = int(s.get("overlay_h",     self.overlay_h))
+            self.countdown_n   = int(s.get("countdown_n",   self.countdown_n))
+            self.overlay_alpha = float(s.get("overlay_alpha", self.overlay_alpha))
+            self.privacy_mode  = bool(s.get("privacy_mode",  self.privacy_mode))
+            overlay_x = s.get("overlay_x", None)
+            self._overlay_x    = int(overlay_x) if overlay_x is not None else None
+            self._overlay_y    = int(s.get("overlay_y", 0))
+            self._controls_x   = s.get("controls_x", None)
+            self._controls_y   = s.get("controls_y", None)
+            if s.get("script_text"):
+                self.script_text = s["script_text"]
+            print(f"[INFO] Settings loaded from: {SETTINGS_PATH}")
+        except Exception as e:
+            print(f"[WARN] Could not load settings ({e}) — using defaults")
+
+    def _save_settings(self):
+        """Save current settings to JSON and show brief confirmation."""
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        # Always read from Tk vars so we capture the latest slider values
+        data = {
+            "speed":         self.var_speed.get(),
+            "font_size":     self.var_font_sz.get(),
+            "overlay_w":     self.var_width.get(),
+            "overlay_h":     self.var_height.get(),
+            "countdown_n":   self.var_countdown.get(),
+            "overlay_alpha": round(self.var_alpha.get(), 2),
+            "privacy_mode":  self.privacy_mode,
+            "overlay_x":     self.overlay.winfo_x(),
+            "overlay_y":     self.overlay.winfo_y(),
+            "controls_x":    self.ctrl_win.winfo_x(),
+            "controls_y":    self.ctrl_win.winfo_y(),
+            "script_text":   self.txt.get("1.0", "end-1c"),
+        }
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] Settings saved to: {SETTINGS_PATH}")
+            self.lbl_saved.config(text=f"✓ Saved to {SETTINGS_PATH}")
+            self.ctrl_win.after(3000, lambda: self.lbl_saved.config(text=""))
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Could not save settings:\n{e}")
+
+    # ──────────────────────────────────────────
     #  Overlay window
     # ──────────────────────────────────────────
     def _build_overlay(self):
@@ -140,14 +221,15 @@ class NotchPrompt:
         self.overlay.title("NotchPrompt")
         self.overlay.overrideredirect(True)      # no title bar
         self.overlay.attributes("-topmost", True)
-        self.overlay.attributes("-alpha", OVERLAY_ALPHA)
+        self.overlay.attributes("-alpha", self.overlay_alpha)
         self.overlay.configure(bg=BG_COLOR)
         self.overlay.protocol("WM_DELETE_WINDOW", self._quit)
 
-        # position: top-centre of primary monitor
+        # position: saved or default top-centre of primary monitor
         sw = self.overlay.winfo_screenwidth()
-        x  = (sw - self.overlay_w) // 2
-        self.overlay.geometry(f"{self.overlay_w}x{self.overlay_h}+{x}+0")
+        x  = self._overlay_x if self._overlay_x is not None else (sw - self.overlay_w) // 2
+        y  = self._overlay_y
+        self.overlay.geometry(f"{self.overlay_w}x{self.overlay_h}+{x}+{y}")
 
         # Canvas for scrolling text
         self.canvas = tk.Canvas(
@@ -207,10 +289,11 @@ class NotchPrompt:
         self.ctrl_win.resizable(False, False)
         self.ctrl_win.protocol("WM_DELETE_WINDOW", self._hide_controls)
 
-        # Position below overlay
+        # Position below overlay — restore saved position if available
         sw = self.ctrl_win.winfo_screenwidth()
-        cx = (sw - 520) // 2
-        self.ctrl_win.geometry(f"520x420+{cx}+160")
+        cx = int(self._controls_x) if self._controls_x is not None else (sw - 520) // 2
+        cy = int(self._controls_y) if self._controls_y is not None else 160
+        self.ctrl_win.geometry(f"520x620+{cx}+{cy}")
 
         # ── script area ────────────────────────
         frm_script = tk.Frame(self.ctrl_win, bg=CTRL_BG)
@@ -225,7 +308,7 @@ class NotchPrompt:
             font=("Segoe UI", 10), wrap="word", undo=True
         )
         self.txt.pack(fill="both", expand=True)
-        self.txt.insert("1.0", self.script_text)
+        self.txt.insert("1.0", self.script_text)  # pre-filled from saved settings or default
         self.txt.bind("<<Modified>>", self._on_script_changed)
 
         # File buttons
@@ -243,6 +326,7 @@ class NotchPrompt:
         self._slider_row(frm_sliders, "Overlay width",  self.var_width,    200, 1800, self._on_size_change,     2)
         self._slider_row(frm_sliders, "Overlay height", self.var_height,   60, 400,   self._on_size_change,     3)
         self._slider_row(frm_sliders, "Countdown (s)",  self.var_countdown,0, 10,     lambda *_: None,          4)
+        self._slider_row(frm_sliders, "Opacity",        self.var_alpha,    0.1, 1.0,  self._on_alpha_change,    5, decimals=2)
 
         # ── transport ──────────────────────────
         frm_transport = tk.Frame(self.ctrl_win, bg=CTRL_BG)
@@ -255,6 +339,15 @@ class NotchPrompt:
 
         for b in (self.btn_play, self.btn_reset, self.btn_back, self.btn_priv):
             b.pack(side="left", padx=4)
+
+        # ── save settings ──────────────────────
+        frm_save = tk.Frame(self.ctrl_win, bg=CTRL_BG)
+        frm_save.pack(pady=(0, 4))
+        self.btn_save = _btn(frm_save, "💾  Save Settings", self._save_settings, accent=True)
+        self.btn_save.pack()
+        self.lbl_saved = tk.Label(frm_save, text="", bg=CTRL_BG, fg="#4CAF50",
+                                  font=("Segoe UI", 8, "italic"))
+        self.lbl_saved.pack(pady=(2, 0))
 
         # ── position controls ──────────────────
         frm_pos = tk.Frame(self.ctrl_win, bg=CTRL_BG)
@@ -274,14 +367,17 @@ class NotchPrompt:
         tk.Label(self.ctrl_win, text=hint, bg=CTRL_BG, fg="#555",
                  font=("Segoe UI", 8)).pack(pady=(0, 6))
 
-    def _slider_row(self, parent, label, var, lo, hi, cmd, row):
+    def _slider_row(self, parent, label, var, lo, hi, cmd, row, decimals=1):
         # Use a StringVar for the display label so we can format it
-        display_var = tk.StringVar(value=f"{var.get():.1f}")
+        display_var = tk.StringVar(value=f"{var.get():.{decimals}f}")
 
         def on_change(val):
-            rounded = round(float(val), 1)
-            display_var.set(f"{rounded:.1f}")
-            var.set(int(rounded) if isinstance(var, tk.IntVar) else rounded)
+            rounded = round(float(val), decimals)
+            display_var.set(f"{rounded:.{decimals}f}")
+            if isinstance(var, tk.IntVar):
+                var.set(int(rounded))
+            else:
+                var.set(rounded)
             cmd(val)
 
         tk.Label(parent, text=label, bg=CTRL_BG, fg=CTRL_FG,
@@ -475,6 +571,10 @@ class NotchPrompt:
 
     def _on_speed_change(self, *_):
         self.speed = self.var_speed.get()
+
+    def _on_alpha_change(self, *_):
+        self.overlay_alpha = round(self.var_alpha.get(), 2)
+        self.overlay.attributes("-alpha", self.overlay_alpha)
 
     def _on_font_change(self, *_):
         self.font_size = self.var_font_sz.get()
