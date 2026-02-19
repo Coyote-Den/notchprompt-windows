@@ -275,14 +275,23 @@ class NotchPrompt:
                  font=("Segoe UI", 8)).pack(pady=(0, 6))
 
     def _slider_row(self, parent, label, var, lo, hi, cmd, row):
+        # Use a StringVar for the display label so we can format it
+        display_var = tk.StringVar(value=f"{var.get():.1f}")
+
+        def on_change(val):
+            rounded = round(float(val), 1)
+            display_var.set(f"{rounded:.1f}")
+            var.set(int(rounded) if isinstance(var, tk.IntVar) else rounded)
+            cmd(val)
+
         tk.Label(parent, text=label, bg=CTRL_BG, fg=CTRL_FG,
                  font=("Segoe UI", 9), width=16, anchor="w"
                  ).grid(row=row, column=0, padx=(0,6), pady=2, sticky="w")
         s = ttk.Scale(parent, from_=lo, to=hi, variable=var,
-                      orient="horizontal", length=280, command=cmd)
+                      orient="horizontal", length=280, command=on_change)
         s.grid(row=row, column=1, sticky="ew")
-        lbl = tk.Label(parent, textvariable=var, bg=CTRL_BG, fg=ACCENT_COLOR,
-                       font=("Segoe UI", 9), width=4)
+        lbl = tk.Label(parent, textvariable=display_var, bg=CTRL_BG, fg=ACCENT_COLOR,
+                       font=("Segoe UI", 9), width=5)
         lbl.grid(row=row, column=2, padx=(6,0))
 
     def _nudge(self, dx):
@@ -357,21 +366,20 @@ class NotchPrompt:
         self._scroll_job = self.overlay.after(SCROLL_TICK_MS, self._scroll_step)
 
     def _do_scroll_step(self):
-        """Simpler move via coords update."""
+        """Scroll by updating y only — x is always fixed to centre."""
         if not self.is_running:
             return
         px_per_tick = self.speed * SCROLL_TICK_MS / 1000.0
         self.scroll_y += px_per_tick
-        # Update y of text item
+        # Fixed x at canvas centre; y moves up as scroll_y grows
+        fixed_x = self.overlay_w // 2
+        new_y = self.overlay_h // 2 - int(self.scroll_y)
+        self.canvas.coords(self._canvas_text_id, fixed_x, new_y)
+        # Stop once the whole text has scrolled past the top
         bb = self.canvas.bbox(self._canvas_text_id)
-        if bb:
-            cur_x = (bb[0] + bb[2]) / 2
-            cur_y = bb[1]
-            new_y = cur_y - px_per_tick
-            self.canvas.coords(self._canvas_text_id, cur_x, new_y)
-            if bb[3] < 0:          # scrolled completely past top
-                self._stop()
-                return
+        if bb and bb[3] < 0:
+            self._stop()
+            return
         self._scroll_job = self.overlay.after(SCROLL_TICK_MS, self._do_scroll_step)
 
     # ──────────────────────────────────────────
